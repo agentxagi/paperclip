@@ -1449,6 +1449,7 @@ export function heartbeatService(db: Db) {
 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const MAX_RUN_DURATION_MS = 2 * 60 * 60 * 1000; // 2 hours — kill any run older than this
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -1460,6 +1461,37 @@ export function heartbeatService(db: Db) {
     const reaped: string[] = [];
 
     for (const run of activeRuns) {
+      // Check max run duration — kill even if process is still alive
+      const startedAt = run.startedAt ? new Date(run.startedAt).getTime() : 0;
+      if (startedAt && now.getTime() - startedAt > MAX_RUN_DURATION_MS) {
+        logger.warn({ runId: run.id, agentId: run.agentId, startedAt: run.startedAt },
+          "run exceeded max duration, killing");
+        await setRunStatus(run.id, "failed", {
+          error: `Run exceeded maximum duration of 2 hours (started at ${run.startedAt})`,
+          errorCode: "max_duration_exceeded",
+          finishedAt: now,
+        });
+        await setWakeupStatus(run.wakeupRequestId, "failed", {
+          finishedAt: now,
+          error: "Run exceeded maximum duration of 2 hours",
+        });
+        const updatedRun = await getRun(run.id);
+        if (updatedRun) {
+          await appendRunEvent(updatedRun, 1, {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "error",
+            message: "Run exceeded maximum duration of 2 hours — killed by scheduler",
+          });
+          await releaseIssueExecutionAndPromote(updatedRun);
+        }
+        await finalizeAgentStatus(run.agentId, "failed");
+        await startNextQueuedRunForAgent(run.agentId);
+        runningProcesses.delete(run.id);
+        reaped.push(run.id);
+        continue;
+      }
+
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives
@@ -2447,17 +2479,18 @@ export function heartbeatService(db: Db) {
         sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
       );
 
-      const issue = await tx
+      // Get ALL issues locked by this run (a single run can lock multiple issues)
+      const lockedIssues = await tx
         .select({
           id: issues.id,
           companyId: issues.companyId,
         })
         .from(issues)
-        .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
-        .then((rows) => rows[0] ?? null);
+        .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)));
 
-      if (!issue) return;
+      if (lockedIssues.length === 0) return;
 
+      // Clear execution lock for ALL issues locked by this run
       await tx
         .update(issues)
         .set({
@@ -2466,24 +2499,31 @@ export function heartbeatService(db: Db) {
           executionLockedAt: null,
           updatedAt: new Date(),
         })
-        .where(eq(issues.id, issue.id));
+        .where(
+          and(
+            eq(issues.companyId, run.companyId),
+            eq(issues.executionRunId, run.id),
+          ),
+        );
 
-      while (true) {
-        const deferred = await tx
-          .select()
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.companyId, issue.companyId),
-              eq(agentWakeupRequests.status, "deferred_issue_execution"),
-              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
-            ),
-          )
-          .orderBy(asc(agentWakeupRequests.requestedAt))
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
+      // Process deferred wakeups for each unlocked issue
+      for (const issue of lockedIssues) {
+        while (true) {
+          const deferred = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+              ),
+            )
+            .orderBy(asc(agentWakeupRequests.requestedAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
 
-        if (!deferred) return null;
+          if (!deferred) break;
 
         const deferredAgent = await tx
           .select()
@@ -2572,8 +2612,10 @@ export function heartbeatService(db: Db) {
           })
           .where(eq(issues.id, issue.id));
 
-        return newRun;
+          return newRun;
+        }
       }
+      return null;
     });
 
     if (!promotedRun) return;
