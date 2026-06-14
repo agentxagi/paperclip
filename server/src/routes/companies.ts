@@ -8,6 +8,8 @@ import {
   updateCompanySchema,
 } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
+import { assertCompanyAccess } from "./authz.js";
+import { dashboardService } from "../services/dashboard.js";
 import { validate } from "../middleware/validate.js";
 import {
   accessService,
@@ -142,6 +144,15 @@ export function companyRoutes(db: Db) {
       );
     }
     res.status(201).json(company);
+  });
+
+  // GET /api/companies/:companyId/dashboard — proxy for UI compatibility
+  router.get("/:companyId/dashboard", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const svc = dashboardService(db);
+    const summary = await svc.summary(companyId);
+    res.json(summary);
   });
 
   router.patch("/:companyId", validate(updateCompanySchema), async (req, res) => {
