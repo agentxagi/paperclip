@@ -3455,6 +3455,19 @@ export function heartbeatService(db: Db) {
       let enqueued = 0;
       let skipped = 0;
 
+      // Global concurrency limit — prevent API rate limiting (429) when
+      // multiple agents are eligible at the same tick. Configurable via
+      // HEARTBEAT_MAX_GLOBAL_CONCURRENCY env var (default: 3).
+      const maxGlobalConcurrency = Math.max(
+        1,
+        Number(process.env.HEARTBEAT_MAX_GLOBAL_CONCURRENCY) || 3,
+      );
+      const [{ globalRunningCount }] = await db
+        .select({ globalRunningCount: sql<number>`count(*)` })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "running"));
+      let availableGlobalSlots = Math.max(0, maxGlobalConcurrency - globalRunningCount);
+
       for (const agent of allAgents) {
         if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") continue;
         const policy = parseHeartbeatPolicy(agent);
@@ -3464,6 +3477,11 @@ export function heartbeatService(db: Db) {
         const baseline = new Date(agent.lastHeartbeatAt ?? agent.createdAt).getTime();
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
+
+        if (availableGlobalSlots <= 0) {
+          skipped += 1;
+          continue;
+        }
 
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
@@ -3477,7 +3495,10 @@ export function heartbeatService(db: Db) {
             now: now.toISOString(),
           },
         });
-        if (run) enqueued += 1;
+        if (run) {
+          enqueued += 1;
+          availableGlobalSlots = Math.max(0, availableGlobalSlots - 1);
+        }
         else skipped += 1;
       }
 
