@@ -160,5 +160,7 @@ ExecStart=tsx src/index.ts (from server/ directory)
 ## Customizations (from upstream)
 
 1. **Dashboard route proxy** — `companies.ts` line ~148
-2. **Systemd service** — production deployment (tsx mode)
-3. **Fork**: `github.com/agentxagi/paperclip`
+2. **Systemd service** — production deployment (tsx mode), HOME=/root, BETTER_AUTH_SECRET, Hermes binary in PATH
+3. **Global concurrency limit** — `heartbeat.ts` tickTimers: HEARTBEAT_MAX_GLOBAL_CONCURRENCY=3 prevents 429 rate limiting when multiple agents are eligible at the same tick
+4. **Persona-based custom prompts** — All 10 agents have custom `promptTemplate` in `adapterConfig` with identity (personality, tone, responsibilities, ValorBrain collections) from the knowledge-catalog personas. Agents respond in character and know their institutional context.
+5. **Fork**: `github.com/agentxagi/paperclip`
